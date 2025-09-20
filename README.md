@@ -1,5 +1,3 @@
-# 🧳 Asistente de Valija con Clima Real
-
 "Este proyecto lo desarrollé con bastante ayuda de IA (ChatGPT – GPT-5 Thinking) como pair programmer para:
 
 mejoras de UX y prompts para OpenAI,
@@ -14,6 +12,8 @@ Todo el código fue revisado y adaptado por mí antes del deploy."
 
 
 
+
+# 🧳 Asistente de Valija con Clima Real
 Genera una **lista de equipaje** a partir del **clima real** del destino (Open-Meteo).  
 Permite perfiles (con niños/negocios), optimización para **carry-on**, recálculo de **cantidades por días**, filtro y **exportar TXT/CSV**.  
 Opcionalmente usa **OpenAI** para crear la lista; si no hay crédito/clave, cae en una **lógica local por reglas**.
