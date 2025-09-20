@@ -24,6 +24,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("valija")
 
+# ========= Proveedores de clima y límites típicos =========
+PROVIDERS = {
+    "open-meteo": {"label": "Open-Meteo (gratis)", "limit_days": 16, "needs_key": False},
+    "visualcrossing": {"label": "Visual Crossing (clave)", "limit_days": 15, "needs_key": True},
+    "weatherbit": {"label": "Weatherbit (clave)", "limit_days": 16, "needs_key": True},
+}
+
+def get_provider_from_env() -> str:
+    p = (os.getenv("WEATHER_PROVIDER") or "open-meteo").strip().lower()
+    return p if p in PROVIDERS else "open-meteo"
+
+def get_provider_limit(provider: str) -> int:
+    return PROVIDERS.get(provider, PROVIDERS["open-meteo"])["limit_days"]
+
 # ================== Utilidades ==================
 def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
@@ -61,10 +75,10 @@ def ddmmyyyy(iso_date: str) -> str:
 @st.cache_resource
 def http():
     s = requests.Session()
-    s.headers.update({"User-Agent": "ValijaApp/1.0 (+https://railway.app)"})
+    s.headers.update({"User-Agent": "ValijaApp/1.1 (+https://railway.app)"})
     return s
 
-# ================== Geocoding & clima ==================
+# ================== Geocoding & clima (Open-Meteo geocoding) ==================
 def geocode_city(city: str) -> Dict:
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": city, "count": 10, "language": "es", "format": "json"}
@@ -93,7 +107,19 @@ def geocode_city(city: str) -> Dict:
         "timezone": res.get("timezone", "auto"),
     }
 
-def fetch_forecast(lat: float, lon: float, start: dt.date, end: dt.date, timezone="auto") -> Dict:
+@st.cache_data(ttl=60*60*6, show_spinner=False)  # 6 hs
+def geocode_city_cached(city: str) -> Dict:
+    return geocode_city(city)
+
+# ================== Clima: wrappers por proveedor ==================
+# --------- Open-Meteo ---------
+def clamp_to_limit(start: dt.date, end: dt.date, limit_days: int) -> tuple[dt.date, dt.date]:
+    today = dt.date.today()
+    api_end = min(end, today + dt.timedelta(days=limit_days))
+    api_start = min(start, api_end)
+    return api_start, api_end
+
+def fetch_forecast_openmeteo(lat: float, lon: float, start: dt.date, end: dt.date, timezone="auto") -> Dict:
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -107,14 +133,92 @@ def fetch_forecast(lat: float, lon: float, start: dt.date, end: dt.date, timezon
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=60*60*6, show_spinner=False)  # 6 hs
-def geocode_city_cached(city: str) -> Dict:
-    return geocode_city(city)
-
 @st.cache_data(ttl=60*30, show_spinner=False)  # 30 min
-def fetch_forecast_cached(lat: float, lon: float, start: dt.date, end: dt.date, timezone="auto") -> Dict:
-    return fetch_forecast(lat, lon, start, end, timezone)
+def fetch_forecast_openmeteo_cached(lat: float, lon: float, start: dt.date, end: dt.date, timezone="auto") -> Dict:
+    return fetch_forecast_openmeteo(lat, lon, start, end, timezone)
 
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_forecast_openmeteo_days_cached(lat: float, lon: float, days: int, timezone="auto") -> Dict:
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weathercode",
+        "timezone": timezone,
+        "forecast_days": max(1, min(16, int(days))),
+    }
+    r = http().get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def slice_daily_by_date(forecast: Dict, start: dt.date, end: dt.date) -> Dict:
+    daily = forecast.get("daily", {})
+    times = daily.get("time", [])
+    if not times:
+        return forecast
+    mask = [(start.isoformat() <= t <= end.isoformat()) for t in times]
+    def _f(arr): return [v for v, keep in zip(arr, mask) if keep]
+    sliced = {k: _f(v) if isinstance(v, list) and len(v) == len(times) else v for k, v in daily.items()}
+    out = dict(forecast)
+    out["daily"] = sliced
+    return out
+
+# --------- Visual Crossing ---------
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_forecast_visualcrossing_cached(lat: float, lon: float, start: dt.date, end: dt.date, api_key: str) -> Dict:
+    base = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
+    # timeline/{lat},{lon}/{start}/{end}
+    url = f"{base}/{lat},{lon}/{start.isoformat()}/{end.isoformat()}"
+    params = {
+        "unitGroup": "metric",
+        "include": "days",
+        "key": api_key.strip(),
+        "contentType": "json",
+    }
+    r = http().get(url, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    # Convertir a estructura "daily" compatible
+    days = data.get("days", [])
+    daily = {
+        "time": [d["datetime"] for d in days],
+        "temperature_2m_min": [d.get("tempmin") for d in days],
+        "temperature_2m_max": [d.get("tempmax") for d in days],
+        "precipitation_probability_max": [d.get("precipprob") for d in days],  # %
+        "weathercode": [None for _ in days],  # no mapeamos códigos VC -> WMO
+        "weatherdesc": [d.get("conditions", "—") for d in days],
+    }
+    return {"daily": daily}
+
+# --------- Weatherbit ---------
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_forecast_weatherbit_cached(lat: float, lon: float, start: dt.date, end: dt.date, api_key: str) -> Dict:
+    # Weatherbit pronostica hacia adelante; pedimos desde HOY hasta máximo 16 días y cortamos por [start,end]
+    today = dt.date.today()
+    to_date = min(end, today + dt.timedelta(days=16))
+    days_needed = max(1, (to_date - today).days + 1)
+    url = "https://api.weatherbit.io/v2.0/forecast/daily"
+    params = {
+        "lat": lat, "lon": lon, "days": min(16, days_needed),
+        "units": "M", "key": api_key.strip(),
+    }
+    r = http().get(url, params=params, timeout=20)
+    r.raise_for_status()
+    js = r.json()
+    arr = js.get("data", [])
+    # Convertir y luego filtrar por rango deseado:
+    all_daily = {
+        "time": [d["valid_date"] for d in arr],
+        "temperature_2m_min": [d.get("min_temp") for d in arr],
+        "temperature_2m_max": [d.get("max_temp") for d in arr],
+        "precipitation_probability_max": [d.get("pop") for d in arr],  # %
+        "weathercode": [None for _ in arr],  # no mapeamos códigos WB -> WMO
+        "weatherdesc": [d.get("weather", {}).get("description", "—") for d in arr],
+    }
+    tmp = {"daily": all_daily}
+    return slice_daily_by_date(tmp, start, end)
+
+# ================== Mapas y helpers de clima ==================
 WEATHER_CODE_MAP = {
     0: "despejado", 1: "mayormente despejado", 2: "parcialmente nublado", 3: "nublado",
     45: "niebla", 48: "niebla escarchada", 51: "llovizna débil", 53: "llovizna", 55: "llovizna intensa",
@@ -126,32 +230,70 @@ WEATHER_CODE_MAP = {
 }
 
 def summarize_weather(daily: Dict) -> str:
+    times = daily.get("time", [])
+    if not times:
+        return "No hay datos de pronóstico disponibles por fuera del rango público."
     lines = []
-    for i, date in enumerate(daily["time"]):
+    for i, date in enumerate(times):
         tmin = daily["temperature_2m_min"][i]
         tmax = daily["temperature_2m_max"][i]
-        pprec = daily.get("precipitation_probability_max", [None]*len(daily["time"]))[i]
-        code = daily.get("weathercode", [None]*len(daily["time"]))[i]
-        desc = WEATHER_CODE_MAP.get(code, "condiciones variables")
-        lines.append(f"{ddmmyyyy(date)}: {desc}, {tmin:.0f}–{tmax:.0f}°C, precip {pprec if pprec is not None else '–'}%")
-    avg_min = sum(daily["temperature_2m_min"]) / len(daily["temperature_2m_min"])
-    avg_max = sum(daily["temperature_2m_max"]) / len(daily["temperature_2m_max"])
+        pprec = daily.get("precipitation_probability_max", [None]*len(times))[i]
+        # Descripción: preferir weatherdesc si existe
+        desc = daily.get("weatherdesc", [])
+        if desc:
+            dsc = desc[i] or "—"
+        else:
+            code = daily.get("weathercode", [None]*len(times))[i]
+            dsc = WEATHER_CODE_MAP.get(code, "—")
+        lines.append(f"{ddmmyyyy(date)}: {dsc}, {tmin:.0f}–{tmax:.0f}°C, precip {pprec if pprec is not None else '—'}%")
+    avg_min = sum(v for v in daily["temperature_2m_min"] if v is not None) / len([v for v in daily["temperature_2m_min"] if v is not None])
+    avg_max = sum(v for v in daily["temperature_2m_max"] if v is not None) / len([v for v in daily["temperature_2m_max"] if v is not None])
     wet_days = sum(1 for p in daily.get("precipitation_probability_max", []) if p is not None and p >= 40)
     header = f"Promedio térmico: mín {avg_min:.1f}°C / máx {avg_max:.1f}°C. Días con alta chance de lluvia (≥40%): {wet_days}."
     return header + "\n" + "\n".join(lines)
 
-def forecast_to_df(daily: Dict) -> pd.DataFrame:
+def forecast_to_df_full_range(daily: Dict, start: dt.date, end: dt.date) -> pd.DataFrame:
+    """Construye el DF para TODO el rango del viaje. Completa 'sin datos' donde no hay pronóstico."""
+    date_list = [start + dt.timedelta(days=i) for i in range((end - start).days + 1)]
+    avail = {}
+    times = daily.get("time", [])
+    for i, iso in enumerate(times):
+        avail[iso] = {
+            "min": daily["temperature_2m_min"][i],
+            "max": daily["temperature_2m_max"][i],
+            "pp": daily.get("precipitation_probability_max", [None]*len(times))[i],
+            "code": daily.get("weathercode", [None]*len(times))[i] if daily.get("weathercode") else None,
+            "desc": daily.get("weatherdesc", [None]*len(times))[i] if daily.get("weatherdesc") else None,
+        }
+
     rows = []
-    for i, date in enumerate(daily["time"]):
-        rows.append({
-            "Fecha": ddmmyyyy(date),
-            "Mín (°C)": round(daily["temperature_2m_min"][i]),
-            "Máx (°C)": round(daily["temperature_2m_max"][i]),
-            "Lluvia %": (daily.get("precipitation_probability_max", [None]*len(daily["time"]))[i] or 0),
-            "Estado": WEATHER_CODE_MAP.get(daily.get("weathercode", [None]*len(daily["time"]))[i], "—"),
-        })
+    for d in date_list:
+        iso = d.isoformat()
+        if iso in avail:
+            tmin = avail[iso]["min"]
+            tmax = avail[iso]["max"]
+            pp = avail[iso]["pp"]
+            code = avail[iso]["code"]
+            desc = avail[iso]["desc"] or WEATHER_CODE_MAP.get(code, "—")
+            umbrella = "🌧️" if (pp is not None and isinstance(pp, (int, float)) and pp >= 40) else ""
+            rows.append({
+                "Fecha": ddmmyyyy(iso),
+                "Mín (°C)": round(tmin) if isinstance(tmin, (int, float)) else "—",
+                "Máx (°C)": round(tmax) if isinstance(tmax, (int, float)) else "—",
+                "Lluvia %": pp if pp is not None else "",
+                "🌧️": umbrella,
+                "Estado": desc,
+            })
+        else:
+            rows.append({
+                "Fecha": ddmmyyyy(iso),
+                "Mín (°C)": "—",
+                "Máx (°C)": "—",
+                "Lluvia %": "",
+                "🌧️": "",
+                "Estado": "(sin datos)",
+            })
     df = pd.DataFrame(rows)
-    df["🌧️"] = df["Lluvia %"].apply(lambda p: "🌧️" if p >= 40 else "")
     return df[["Fecha", "Mín (°C)", "Máx (°C)", "Lluvia %", "🌧️", "Estado"]]
 
 # ================== Lógica local (reglas más finas) ==================
@@ -228,7 +370,6 @@ def rule_based_packing(
     if any(x in a for a in acts for x in ("noche", "resto", "eleg")):
         base["Ropa"] += ["1 outfit arreglado"]
         base["Calzado"] += ["Zapatos/zapatillas urbanas limpias"]
-    # NUEVO: playa explícita (además de la lógica por 'very_hot')
     if any("playa" in a for a in acts):
         base["Ropa"] += [f"Traje de baño x{max(1, q(max(1, days//5)))}"]
         base["Calzado"] += ["Ojotas"]
@@ -320,7 +461,6 @@ def ensure_quantities_and_extras(
 # ================== OpenAI (opcional) ==================
 def generate_packing_with_openai(weather_brief: str, city: str, days: int, activities: List[str], options: dict) -> Dict[str, List[str]]:
     raw_key = os.getenv("OPENAI_API_KEY", "")
-    # Sanitiza: quedate con la primera línea y sin espacios
     api_key = raw_key.strip().splitlines()[0] if raw_key else ""
     if not api_key or not api_key.startswith(("sk-", "rk-")):
         raise RuntimeError("OPENAI_API_KEY no configurada.")
@@ -381,10 +521,18 @@ def export_txt(packing: Dict[str, List[str]]) -> str:
 
 # ================== UI ==================
 st.title("🧳 Asistente de Valija con Clima Real")
-st.caption("Destino + fechas → clima (Open-Meteo) → lista de equipaje. Hecho por Juanma 😉")
+st.caption("Destino + fechas → clima → lista de equipaje. Hecho por Juanma 😉")
 
 with st.sidebar:
     st.header("⚙️ Preferencias")
+    # Proveedor de clima
+    providers_labels = [PROVIDERS[k]["label"] for k in PROVIDERS]
+    providers_keys = list(PROVIDERS.keys())
+    default_key = get_provider_from_env()
+    provider_idx = providers_keys.index(default_key)
+    provider_choice = st.selectbox("Proveedor de clima", providers_labels, index=provider_idx)
+    provider = providers_keys[providers_labels.index(provider_choice)]
+    # Opciones
     detail_level = st.slider("Nivel de detalle", 1, 5, 3)
     traveler_profiles = st.multiselect("Perfil del viaje", ["solo", "en pareja", "con niños", "negocios", "mochilero"], default=[])
     carry_on = st.toggle("Optimizar equipaje de mano")
@@ -400,11 +548,22 @@ with st.form("trip_form"):
         start_date = st.date_input("Fecha de inicio", value=dt.date.today() + dt.timedelta(days=7), format="DD/MM/YYYY")
     with c2:
         end_date = st.date_input("Fecha de regreso", value=dt.date.today() + dt.timedelta(days=14), format="DD/MM/YYYY")
+
     # Vista previa de cantidad de días
     days_preview = (end_date - start_date).days + 1 if end_date >= start_date else 0
     st.caption(f"Días seleccionados: **{days_preview}**" if days_preview > 0 else "Elegí un rango válido (fin ≥ inicio).")
 
-    # ====== Actividades: multiselect + extras (sin 'gym') ======
+    # Aviso según límite del proveedor elegido
+    limit_date = dt.date.today() + dt.timedelta(days=get_provider_limit(provider))
+    if end_date > limit_date:
+        st.caption(
+            f"⚠️ El pronóstico de {PROVIDERS[provider]['label'].split(' (')[0]} cubre hasta "
+            f"{get_provider_limit(provider)} días desde hoy ({limit_date.strftime('%d/%m/%Y')}). "
+            "Se mostrará clima hasta esa fecha; el resto de los días del viaje se verán como “(sin datos)”. "
+            "Las cantidades se calcularán para todos tus días."
+        )
+
+    # Actividades
     ACTIVITY_PRESETS = ["playa", "trekking", "salidas nocturnas", "nieve", "montaña"]
     acts_selected = st.multiselect("Actividades (elegí de la lista)", ACTIVITY_PRESETS, default=[])
     acts_extra = st.text_input("…o agregá otras (separá por coma)", placeholder="city tour, snorkel, eventos")
@@ -412,16 +571,69 @@ with st.form("trip_form"):
 
     submit = st.form_submit_button("Generar")
 
-def compute_and_store(city, start_date, end_date, activities, detail_level, traveler_profiles, carry_on, laundry, language, gen_mode="Automático"):
-    log.info(f"compute_and_store city={city} {start_date}→{end_date} days={ (end_date - start_date).days + 1 } mode={gen_mode}")
+# ================== Orquestación ==================
+def compute_and_store(city, start_date, end_date, activities, detail_level, traveler_profiles, carry_on, laundry, language, gen_mode, provider):
+    log.info(f"compute_and_store city={city} {start_date}→{end_date} days={ (end_date - start_date).days + 1 } mode={gen_mode} provider={provider}")
     geo = geocode_city_cached(city)
-    forecast = fetch_forecast_cached(geo["lat"], geo["lon"], start_date, end_date, geo["timezone"])
-    daily = forecast["daily"]
-    weather_brief = summarize_weather(daily)
 
-    avg_min = sum(daily["temperature_2m_min"]) / len(daily["temperature_2m_min"])
-    avg_max = sum(daily["temperature_2m_max"]) / len(daily["temperature_2m_max"])
-    wet_days = sum(1 for p in daily.get("precipitation_probability_max", []) if p is not None and p >= 40)
+    limit_days = get_provider_limit(provider)
+    api_start, api_end = clamp_to_limit(start_date, end_date, limit_days)
+
+    # Elegir proveedor
+    daily = {}
+    available_start = available_end = None
+    try:
+        if provider == "open-meteo":
+            try:
+                resp = fetch_forecast_openmeteo_cached(geo["lat"], geo["lon"], api_start, api_end, "auto")
+            except requests.HTTPError as e:
+                if getattr(e, "response", None) is not None and e.response.status_code == 400:
+                    days_needed = (min(api_end, dt.date.today() + dt.timedelta(days=limit_days)) - dt.date.today()).days + 1
+                    alt = fetch_forecast_openmeteo_days_cached(geo["lat"], geo["lon"], days_needed, "auto")
+                    resp = slice_daily_by_date(alt, api_start, api_end)
+                else:
+                    raise
+            daily = resp.get("daily", {})
+
+        elif provider == "visualcrossing":
+            key = os.getenv("VISUALCROSSING_KEY", "").strip()
+            if not key:
+                st.info("Falta VISUALCROSSING_KEY; usando Open-Meteo.", icon="ℹ️")
+                resp = fetch_forecast_openmeteo_cached(geo["lat"], geo["lon"], api_start, api_end, "auto")
+                daily = resp.get("daily", {})
+            else:
+                resp = fetch_forecast_visualcrossing_cached(geo["lat"], geo["lon"], api_start, api_end, key)
+                daily = resp.get("daily", {})
+
+        elif provider == "weatherbit":
+            key = os.getenv("WEATHERBIT_KEY", "").strip()
+            if not key:
+                st.info("Falta WEATHERBIT_KEY; usando Open-Meteo.", icon="ℹ️")
+                resp = fetch_forecast_openmeteo_cached(geo["lat"], geo["lon"], api_start, api_end, "auto")
+                daily = resp.get("daily", {})
+            else:
+                resp = fetch_forecast_weatherbit_cached(geo["lat"], geo["lon"], api_start, api_end, key)
+                daily = resp.get("daily", {})
+
+        times = daily.get("time", [])
+        if times:
+            available_start = dt.date.fromisoformat(times[0])
+            available_end = dt.date.fromisoformat(times[-1])
+    except Exception:
+        log.exception("Fallo obteniendo pronóstico; continuamos sin datos.")
+        daily = {"time": []}
+
+    # Métricas climáticas para reglas
+    times = daily.get("time", [])
+    if times:
+        tmins = [v for v in daily["temperature_2m_min"] if isinstance(v, (int, float))]
+        tmaxs = [v for v in daily["temperature_2m_max"] if isinstance(v, (int, float))]
+        avg_min = sum(tmins) / len(tmins) if tmins else 18.0
+        avg_max = sum(tmaxs) / len(tmaxs) if tmaxs else 24.0
+        wet_days = sum(1 for p in daily.get("precipitation_probability_max", []) if isinstance(p, (int, float)) and p >= 40)
+    else:
+        avg_min, avg_max, wet_days = 18.0, 24.0, 0
+
     acts = [normalize_text(a) for a in activities.split(",")] if activities else []
     trip_days = (end_date - start_date).days + 1
 
@@ -431,6 +643,7 @@ def compute_and_store(city, start_date, end_date, activities, detail_level, trav
 
     if use_openai and gen_mode != "Forzar local":
         try:
+            weather_brief = summarize_weather(daily) if times else "No hay datos de pronóstico disponibles."
             packing = generate_packing_with_openai(weather_brief, geo["name"], trip_days, acts, opts)
             st.success("Lista generada con OpenAI ✅")
         except Exception as e:
@@ -455,9 +668,14 @@ def compute_and_store(city, start_date, end_date, activities, detail_level, trav
 
     st.session_state["packing"] = packing
     st.session_state["meta"] = {
-        "geo": geo, "weather_brief": weather_brief, "avg_min": avg_min, "avg_max": avg_max, "wet_days": wet_days,
+        "geo": geo,
+        "avg_min": avg_min, "avg_max": avg_max, "wet_days": wet_days,
         "trip_days": trip_days, "acts": acts, "opts": opts, "date_range": (start_date, end_date),
         "activities_raw": activities or "", "city_raw": city, "daily": daily,
+        "api_date_range": (api_start, api_end),
+        "available_range": (available_start, available_end),
+        "forecast_limited": (not times) or (available_start and available_start > start_date) or (available_end and available_end < end_date),
+        "provider": provider,
     }
 
 # ============== Acciones de usuario (submit / aplicar) ==================
@@ -466,7 +684,7 @@ if submit:
         st.error("Completá la ciudad y verificá el rango de fechas.")
     else:
         try:
-            compute_and_store(city, start_date, end_date, activities, detail_level, traveler_profiles, carry_on, laundry, language, gen_mode)
+            compute_and_store(city, start_date, end_date, activities, detail_level, traveler_profiles, carry_on, laundry, language, gen_mode, provider)
             st.success("Preferencias aplicadas ✅")
         except Exception as e:
             log.exception("Fallo en compute_and_store")
@@ -476,7 +694,7 @@ if apply_sidebar and ("packing" in st.session_state) and ("meta" in st.session_s
     m = st.session_state["meta"]
     try:
         compute_and_store(m["city_raw"], m["date_range"][0], m["date_range"][1], m["activities_raw"],
-                          detail_level, traveler_profiles, carry_on, laundry, language, gen_mode)
+                          detail_level, traveler_profiles, carry_on, laundry, language, gen_mode, provider)
         st.success("Preferencias aplicadas ✅")
     except Exception as e:
         log.exception("Fallo al aplicar cambios")
@@ -488,10 +706,31 @@ if "packing" in st.session_state and st.session_state["packing"]:
     m = st.session_state["meta"]
 
     st.subheader(f"📍 {m['geo']['name']}, {m['geo']['country']}")
-    st.markdown(f"**Fechas:** {m['date_range'][0].strftime('%d/%m/%Y')} → {m['date_range'][1].strftime('%d/%m/%Y')} &nbsp;•&nbsp; **Días:** {m['trip_days']}")
-    st.dataframe(forecast_to_df(m["daily"]), hide_index=True, use_container_width=True)
+    prov_name = PROVIDERS[m.get("provider", "open-meteo")]["label"].split(" (")[0]
+    st.markdown(
+        f"**Fechas:** {m['date_range'][0].strftime('%d/%m/%Y')} → {m['date_range'][1].strftime('%d/%m/%Y')} "
+        f"&nbsp;•&nbsp; **Días:** {m['trip_days']} &nbsp;•&nbsp; **Clima:** {prov_name}"
+    )
 
-    # ===== Aplicar acciones en bloque (si quedaron pendientes del clic anterior) =====
+    # Aviso si el pronóstico fue recortado o faltan días (sin datos)
+    if m.get("forecast_limited"):
+        avail_end = m.get("available_range", (None, None))[1]
+        if avail_end:
+            limit_str = avail_end.strftime('%d/%m/%Y')
+        else:
+            limit_str = (dt.date.today() + dt.timedelta(days=get_provider_limit(m.get("provider","open-meteo")))).strftime('%d/%m/%Y')
+        st.warning(
+            f"🔎 El pronóstico muestra datos hasta **{limit_str}**. "
+            "Para el resto de los días se verá **(sin datos)** en la tabla, "
+            f"pero la lista y las cantidades se generan igualmente para **{m['trip_days']}** días.",
+            icon="ℹ️",
+        )
+
+    # Tabla con TODO el rango del viaje; completa '(sin datos)' más allá del límite
+    df_forecast = forecast_to_df_full_range(m["daily"], m["date_range"][0], m["date_range"][1])
+    st.dataframe(df_forecast, hide_index=True, use_container_width=True)
+
+    # ===== Acciones en bloque =====
     pending = st.session_state.pop("__bulk_action__", None)
     if pending:
         action = pending.get("type")
@@ -506,7 +745,7 @@ if "packing" in st.session_state and st.session_state["packing"]:
                     elif action == "reset":
                         st.session_state.pop(k, None)
 
-    # Checkboxes con keys únicas
+    # Checkboxes por categoría
     st.subheader("✅ Lista sugerida para la valija")
     for cat, items in packing.items():
         with st.expander(cat, expanded=True):
@@ -526,7 +765,7 @@ if "packing" in st.session_state and st.session_state["packing"]:
     st.write(f"Progreso: **{done}/{total}** ({round(pct*100)}%)")
     st.progress(pct)
 
-    # Botones Marcar/Desmarcar/Reset (debajo del progreso) -> encolan acción y rerun
+    # Botones Marcar/Desmarcar/Reset
     cma, cmb, cmc = st.columns(3)
     with cma:
         if st.button("Marcar todo"):
@@ -610,7 +849,6 @@ if "packing" in st.session_state and st.session_state["packing"]:
 
     if regen_btn:
         try:
-            # modificar opts/acts según enfoque
             if regen_focus == "Más detalle":
                 m["opts"]["detail_level"] = min(5, m["opts"]["detail_level"] + 1)
             elif regen_focus == "Minimalista (carry-on)":
@@ -623,7 +861,7 @@ if "packing" in st.session_state and st.session_state["packing"]:
             compute_and_store(
                 m["city_raw"], m["date_range"][0], m["date_range"][1],
                 m["activities_raw"], m["opts"]["detail_level"], m["opts"]["profiles"],
-                m["opts"]["carry_on"], m["opts"]["laundry"], m["opts"]["language"], gen_mode
+                m["opts"]["carry_on"], m["opts"]["laundry"], m["opts"]["language"], gen_mode, provider
             )
             st.success("Lista regenerada ✅")
         except Exception as e:
