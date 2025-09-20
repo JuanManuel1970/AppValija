@@ -323,8 +323,9 @@ def generate_packing_with_openai(weather_brief: str, city: str, days: int, activ
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY no configurada.")
 
-    import openai
-    client = openai.OpenAI(api_key=api_key)
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     prompt = f"""
