@@ -51,6 +51,7 @@ Opcionalmente usa **OpenAI** para crear la lista; si no hay crédito/clave, cae 
 
 📦 Exportar listas
 
+
 TXT con destino, fechas, días y lista formateada.
 
 CSV con columnas: destino, fechas, días, categoría, ítem, estado (empacado)
@@ -59,6 +60,7 @@ CSV con columnas: destino, fechas, días, categoría, ítem, estado (empacado)
 
 
 ⚙️ Variables de entorno
+
 
 OPENAI_API_KEY → tu key de OpenAI (si no, usa reglas locales).
 
@@ -72,6 +74,7 @@ Importante (Railway): OPENAI_API_KEY debe estar en una sola línea y contener s�
 
 
 ## 🚀 Ejecución local
+
 
 ```bash
 python -m venv .venv
