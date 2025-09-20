@@ -1,0 +1,27 @@
+# Entorno virtual
+.venv/
+env/
+venv/
+
+# Archivos de entorno y credenciales
+.env
+*.env
+
+# Cachés y compilados
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Archivos temporales
+*.tmp
+*.swp
+.DS_Store
+
+# Salidas de Streamlit
+.streamlit/
+
+# Archivos de sistema de Windows
+Thumbs.db
+desktop.ini
