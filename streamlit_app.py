@@ -462,4 +462,3 @@ if st.session_state.packing:
         except Exception as e:
             st.info("Usando lógica local (sin OpenAI) ✅")
             st.caption(f"Motivo: {e}")
-class
