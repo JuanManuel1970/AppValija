@@ -69,3 +69,64 @@ pip install -r requirements.txt
 # 3) Correr
 streamlit run streamlit_app.py
 
+📦 Exportar
+
+TXT con encabezado (destino, fechas, días, perfiles/flags).
+
+CSV con columnas: destino, fechas, días, categoría, ítem, estado (empacado).
+
+🧯 Observabilidad & performance (Railway)
+
+LOGLEVEL=INFO para ver hitos (geocoding, forecast, IA OK/fallback).
+
+Cache de geocoding (6h) y forecast (30m) para reducir latencia y consumo.
+
+Si el servicio “duerme”, podés mantenerlo vivo con un ping externo cada 15–30 min.
+
+📚 Servicios usados
+
+Open-Meteo Geocoding: https://geocoding-api.open-meteo.com/v1/search
+
+Open-Meteo Forecast: https://api.open-meteo.com/v1/forecast
+
+OpenAI Chat Completions (opcional)
+
+🧾 Requisitos
+
+requirements.txt:
+
+streamlit==1.38.0
+pandas==2.2.2
+python-dotenv==1.0.1
+requests==2.32.3
+openai==1.43.0
+httpx==0.27.2
+
+🔍 Roadmap
+
+Más reglas por actividad (deportes acuáticos, camping, bici).
+
+Guardado/restauración de listas personalizadas.
+
+Internacionalización ampliada (más idiomas).
+
+Captura opcional de email para enviarse la lista.
+
+🤝 Transparencia (ayuda de IA)
+
+Este proyecto lo desarrollé con bastante ayuda de IA (ChatGPT – GPT-5 Thinking) como pair programmer para:
+
+refactors y mejoras de UX,
+
+prompts para la integración con OpenAI,
+
+solución de bugs (deploy en Railway, diferencias de SDK, manejo de session_state en Streamlit),
+
+y redacción de este README.
+
+Todo el código fue revisado y adaptado por mí antes del deploy.
+
+🧑‍💻 Autor
+
+Juan Manuel — GitHub
+
