@@ -48,12 +48,16 @@ Opcionalmente usa **OpenAI** para crear la lista; si no hay crédito/clave, cae 
 - ⚡ Cache con `st.cache_data` y `st.cache_resource`
 
 ---
+
 📦 Exportar listas
 
 TXT con destino, fechas, días y lista formateada.
 
 CSV con columnas: destino, fechas, días, categoría, ítem, estado (empacado)
+
 ---
+
+
 ⚙️ Variables de entorno
 
 OPENAI_API_KEY → tu key de OpenAI (si no, usa reglas locales).
@@ -63,6 +67,7 @@ OPENAI_MODEL → por defecto gpt-4o-mini.
 LOGLEVEL → INFO / DEBUG para ver logs en Railway.
 
 Importante (Railway): OPENAI_API_KEY debe estar en una sola línea y contener sólo la key.
+
 ---
 
 
