@@ -5,7 +5,7 @@ import logging
 import unicodedata
 import datetime as dt
 from typing import List, Dict
-
+from openai import OpenAI  
 import requests
 import pandas as pd
 import streamlit as st
@@ -319,13 +319,13 @@ def ensure_quantities_and_extras(
 
 # ================== OpenAI (opcional) ==================
 def generate_packing_with_openai(weather_brief: str, city: str, days: int, activities: List[str], options: dict) -> Dict[str, List[str]]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    raw_key = os.getenv("OPENAI_API_KEY", "")
+    # Sanitiza: quedate con la primera línea y sin espacios
+    api_key = raw_key.strip().splitlines()[0] if raw_key else ""
+    if not api_key or not api_key.startswith(("sk-", "rk-")):
         raise RuntimeError("OPENAI_API_KEY no configurada.")
 
-    from openai import OpenAI
     client = OpenAI(api_key=api_key)
-
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     prompt = f"""
