@@ -5,11 +5,12 @@ import logging
 import unicodedata
 import datetime as dt
 from typing import List, Dict
-from openai import OpenAI  
+
 import requests
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from openai import OpenAI  # SDK nuevo
 
 load_dotenv(override=True)
 
@@ -227,12 +228,11 @@ def rule_based_packing(
     if any(x in a for a in acts for x in ("noche", "resto", "eleg")):
         base["Ropa"] += ["1 outfit arreglado"]
         base["Calzado"] += ["Zapatos/zapatillas urbanas limpias"]
-    if any("gim" in a or "gym" in a for a in acts):
-        base["Ropa"] += [f"Ropa deportiva x{max(1, q(max(2, days//3)))}"]
-        base["Calzado"] += ["Zapatillas deportivas"]
-    if any("nieve" in a or "ski" in a for a in acts):
-        base["Ropa"] += ["Pantalón de nieve", "Segunda piel térmica"]
-        base["Varios"] += ["Guantes impermeables", "Antiparras"]
+    # NUEVO: playa explícita (además de la lógica por 'very_hot')
+    if any("playa" in a for a in acts):
+        base["Ropa"] += [f"Traje de baño x{max(1, q(max(1, days//5)))}"]
+        base["Calzado"] += ["Ojotas"]
+        base["Varios"] += ["Toalla de playa"]
 
     # Perfiles
     if "con niños" in profiles:
@@ -393,8 +393,6 @@ with st.sidebar:
     gen_mode = st.selectbox("Generación", ["Automático", "Forzar local", "Forzar OpenAI"], index=0)
     apply_sidebar = st.button("🔄 Aplicar cambios")
 
-   
-
 with st.form("trip_form"):
     city = st.text_input("¿A dónde viajás?", placeholder="Ej: Mar del Plata, Argentina")
     c1, c2 = st.columns(2)
@@ -402,11 +400,16 @@ with st.form("trip_form"):
         start_date = st.date_input("Fecha de inicio", value=dt.date.today() + dt.timedelta(days=7), format="DD/MM/YYYY")
     with c2:
         end_date = st.date_input("Fecha de regreso", value=dt.date.today() + dt.timedelta(days=14), format="DD/MM/YYYY")
-        # debajo de end_date = st.date_input(...)
+    # Vista previa de cantidad de días
     days_preview = (end_date - start_date).days + 1 if end_date >= start_date else 0
     st.caption(f"Días seleccionados: **{days_preview}**" if days_preview > 0 else "Elegí un rango válido (fin ≥ inicio).")
 
-    activities = st.text_input("Actividades (opcional, separá por coma)", placeholder="playa, trekking, salidas nocturnas")
+    # ====== Actividades: multiselect + extras (sin 'gym') ======
+    ACTIVITY_PRESETS = ["playa", "trekking", "salidas nocturnas", "nieve", "montaña"]
+    acts_selected = st.multiselect("Actividades (elegí de la lista)", ACTIVITY_PRESETS, default=[])
+    acts_extra = st.text_input("…o agregá otras (separá por coma)", placeholder="city tour, snorkel, eventos")
+    activities = ", ".join(acts_selected + ([acts_extra] if acts_extra else []))
+
     submit = st.form_submit_button("Generar")
 
 def compute_and_store(city, start_date, end_date, activities, detail_level, traveler_profiles, carry_on, laundry, language, gen_mode="Automático"):
@@ -485,28 +488,23 @@ if "packing" in st.session_state and st.session_state["packing"]:
     m = st.session_state["meta"]
 
     st.subheader(f"📍 {m['geo']['name']}, {m['geo']['country']}")
+    st.markdown(f"**Fechas:** {m['date_range'][0].strftime('%d/%m/%Y')} → {m['date_range'][1].strftime('%d/%m/%Y')} &nbsp;•&nbsp; **Días:** {m['trip_days']}")
     st.dataframe(forecast_to_df(m["daily"]), hide_index=True, use_container_width=True)
 
-    # Botones Marcar/Desmarcar/Reset (antes de checkboxes)
-    cma, cmb, cmc = st.columns(3)
-    with cma:
-        if st.button("Marcar todo"):
+    # ===== Aplicar acciones en bloque (si quedaron pendientes del clic anterior) =====
+    pending = st.session_state.pop("__bulk_action__", None)
+    if pending:
+        action = pending.get("type")
+        if action in {"mark_all", "unmark_all", "reset"}:
             for cat, items in packing.items():
                 for idx, it in enumerate(items):
-                    st.session_state[make_key(cat, it, idx)] = True
-            st.rerun()
-    with cmb:
-        if st.button("Desmarcar todo"):
-            for cat, items in packing.items():
-                for idx, it in enumerate(items):
-                    st.session_state[make_key(cat, it, idx)] = False
-            st.rerun()
-    with cmc:
-        if st.button("Resetear selección"):
-            for cat, items in packing.items():
-                for idx, it in enumerate(items):
-                    st.session_state.pop(make_key(cat, it, idx), None)
-            st.rerun()
+                    k = make_key(cat, it, idx)
+                    if action == "mark_all":
+                        st.session_state[k] = True
+                    elif action == "unmark_all":
+                        st.session_state[k] = False
+                    elif action == "reset":
+                        st.session_state.pop(k, None)
 
     # Checkboxes con keys únicas
     st.subheader("✅ Lista sugerida para la valija")
@@ -527,6 +525,21 @@ if "packing" in st.session_state and st.session_state["packing"]:
     pct = (done / total) if total else 0
     st.write(f"Progreso: **{done}/{total}** ({round(pct*100)}%)")
     st.progress(pct)
+
+    # Botones Marcar/Desmarcar/Reset (debajo del progreso) -> encolan acción y rerun
+    cma, cmb, cmc = st.columns(3)
+    with cma:
+        if st.button("Marcar todo"):
+            st.session_state["__bulk_action__"] = {"type": "mark_all"}
+            st.rerun()
+    with cmb:
+        if st.button("Desmarcar todo"):
+            st.session_state["__bulk_action__"] = {"type": "unmark_all"}
+            st.rerun()
+    with cmc:
+        if st.button("Resetear selección"):
+            st.session_state["__bulk_action__"] = {"type": "reset"}
+            st.rerun()
 
     # Agregar ítem manual
     with st.form("add_item_form", clear_on_submit=True):
